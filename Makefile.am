@@ -1,3 +1,6 @@
+# Add m4 directory to aclocal flags
+ACLOCAL_AMFLAGS = -I m4
+
 # We are building a module for Asterisk.
 # This is the name of the module file.
 TARGET=chan_dongle_ng.so
