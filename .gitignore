@@ -1,0 +1,34 @@
+# Autotools generated files
+/configure
+/autom4te.cache/
+/config.h.in
+/config.h
+/Makefile.in
+/aclocal.m4
+/compile
+/depcomp
+/install-sh
+/missing
+/m4/libtool.m4
+/m4/ltoptions.m4
+/m4/ltsugar.m4
+/m4/ltversion.m4
+/m4/lt~obsolete.m4
+
+# Libtool generated files
+/.libs/
+/*.la
+/*.lo
+
+# Object files
+/*.o
+
+# Compiled executables/libraries
+/*.so
+
+# Build directory
+/build/
+
+# User-specific files
+*.swp
+*~
