@@ -2,11 +2,12 @@
  * Asterisk Channel Driver for modern 4G/5G modems
  * Project: asterisk-dongle-ng
  *
- * Phase 7: Manual Hard Reset (v3 - Enhanced Reset Command)
+ * Phase 7: Call State Management & Reader Thread
  *
- * This version enhances the CLI reset command to allow resetting
- * a device by its direct path (e.g., 'dongle reset path /dev/ttyUSB0'),
- * which is crucial for recovering modems that are completely unresponsive.
+ * This version introduces a dedicated reader thread for each dongle to
+ * listen for unsolicited AT responses (URCs). This allows us to detect
+ * call state changes like CONNECT, BUSY, and NO CARRIER, and update
+ * the Asterisk channel state accordingly.
  */
 
 // --- المتطلبات الأساسية للموديول ---
@@ -36,7 +37,7 @@
 #include <dirent.h>
 #include <poll.h>
 #include <ctype.h>
-#include <stdlib.h> // Required for system()
+#include <stdlib.h>
 
 // --- تعريفات ---
 #define MAX_DONGLES 16
@@ -68,6 +69,8 @@ struct dongle_device {
 	enum dongle_state state;
 	ast_mutex_t lock;
 	struct dongle_pvt *pvt;
+	pthread_t reader_thread; // خيط الاستماع المخصص لهذا الجهاز
+	int reader_thread_running; // علم للتحكم في الخيط
 };
 
 // --- متغيرات عامة ---
@@ -83,6 +86,7 @@ static struct ast_frame *dongle_read(struct ast_channel *ast);
 static int dongle_write(struct ast_channel *ast, struct ast_frame *frame);
 static int dongle_indicate(struct ast_channel *ast, int condition, const void *data, size_t datalen);
 static char *handle_cli_reset(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static void *dongle_reader_main(void *data);
 
 
 // --- هيكل تعريف تكنولوجيا القناة ---
@@ -327,6 +331,14 @@ static int scan_for_dongles(void)
 					set_interface_attribs(d->at_fd, B115200);
 					ast_mutex_init(&d->lock);
 					d->state = DONGLE_STATE_READY;
+					d->reader_thread_running = 1;
+					// إنشاء وتشغيل خيط الاستماع
+					if (ast_pthread_create_background(&d->reader_thread, NULL, dongle_reader_main, d)) {
+						ast_log(LOG_ERROR, "Failed to create reader thread for %s\n", d->name);
+						close(d->at_fd);
+						continue;
+					}
+
 					ast_log(LOG_NOTICE, "Dongle-NG (%s): Device is now in READY state.\n", d->name);
 					num_dongles++;
 				}
@@ -362,8 +374,7 @@ static int dongle_call(struct ast_channel *ast, const char *dest, int timeout)
 	write(dev->at_fd, cmdbuf, strlen(cmdbuf));
 	ast_mutex_unlock(&dev->lock);
 
-	ast_channel_state_set(ast, AST_STATE_RINGING);
-
+	// لا نغير الحالة هنا، سننتظر رد CONNECT من خيط الاستماع
 	return 0;
 }
 
@@ -499,7 +510,6 @@ static char *handle_cli_reset(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 		return CLI_SHOWUSAGE;
 	}
 
-    // Handle 'dongle reset <name>'
     if (a->argc == 3) {
         struct dongle_device *d = find_dongle_by_name(a->argv[2]);
         if (!d) {
@@ -512,7 +522,6 @@ static char *handle_cli_reset(struct ast_cli_entry *e, int cmd, struct ast_cli_a
         }
         target_path = d->at_path;
     } 
-    // Handle 'dongle reset path /dev/ttyUSBx'
     else if (a->argc == 4 && strcasecmp(a->argv[2], "path") == 0) {
         if (strncmp(a->argv[3], "/dev/ttyUSB", 11) != 0) {
             ast_cli(a->fd, "Invalid path: '%s'. Path must start with /dev/ttyUSB.\n", a->argv[3]);
@@ -534,6 +543,58 @@ static char *handle_cli_reset(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	ast_cli(a->fd, "Reset command sent. Please wait a few seconds, then 'module reload' to re-scan devices.\n");
 
 	return CLI_SUCCESS;
+}
+
+// --- خيط الاستماع الرئيسي ---
+static void *dongle_reader_main(void *data)
+{
+	struct dongle_device *d = data;
+	char buffer[1024];
+	struct pollfd pfd;
+
+	ast_log(LOG_NOTICE, "Dongle-NG (%s): Reader thread started.\n", d->name);
+
+	pfd.fd = d->at_fd;
+	pfd.events = POLLIN;
+
+	while(d->reader_thread_running) {
+		int n = poll(&pfd, 1, 1000); // انتظر ثانية واحدة
+		if (n < 0) {
+			ast_log(LOG_ERROR, "Dongle-NG (%s): Poll error in reader thread. Exiting.\n", d->name);
+			break;
+		}
+		if (n == 0) { // لا توجد بيانات
+			continue;
+		}
+
+		if (pfd.revents & POLLIN) {
+			memset(buffer, 0, sizeof(buffer));
+			n = read(d->at_fd, buffer, sizeof(buffer) - 1);
+			if (n <= 0) {
+				ast_log(LOG_ERROR, "Dongle-NG (%s): Read error in reader thread. Exiting.\n", d->name);
+				break;
+			}
+			
+			ast_log(LOG_NOTICE, "Dongle-NG (%s): Received URC: %s\n", d->name, buffer);
+
+			// تحليل الرسائل الواردة
+			if (d->pvt && d->pvt->owner) {
+				if (strstr(buffer, "CONNECT")) {
+					ast_log(LOG_NOTICE, "Dongle-NG (%s): Call connected! Answering channel.\n", d->name);
+					ast_channel_answer(d->pvt->owner);
+				} else if (strstr(buffer, "BUSY")) {
+					ast_log(LOG_NOTICE, "Dongle-NG (%s): Call is busy. Hanging up.\n", d->name);
+					ast_queue_hangup_with_cause(d->pvt->owner, AST_CAUSE_BUSY);
+				} else if (strstr(buffer, "NO CARRIER")) {
+					ast_log(LOG_NOTICE, "Dongle-NG (%s): No carrier. Hanging up.\n", d->name);
+					ast_queue_hangup_with_cause(d->pvt->owner, AST_CAUSE_NO_ANSWER);
+				}
+			}
+		}
+	}
+
+	ast_log(LOG_NOTICE, "Dongle-NG (%s): Reader thread finished.\n", d->name);
+	return NULL;
 }
 
 
@@ -589,7 +650,8 @@ static int unload_module(void)
 		struct dongle_device *d = &dongles[i];
 		if (d->state != DONGLE_STATE_FREE) {
 			ast_log(LOG_NOTICE, "Dongle-NG (%s): Shutting down device...\n", d->name);
-			d->state = DONGLE_STATE_FREE;
+			d->reader_thread_running = 0;
+			pthread_join(d->reader_thread, NULL);
 			close(d->at_fd);
 			ast_mutex_destroy(&d->lock);
 		}
